@@ -18,16 +18,38 @@ MIDI_NAME_SUBSTR = "X-TOUCH"
 OBS_HOST = "192.168.1.10"
 OBS_PORT = 4455
 OBS_PASSWORD = "5lTGhDUiwGeKYcVx"
-POLL_INTERVAL = 1.0  # Increased interval, since MIDI->OBS is now real-time
+POLL_INTERVAL = 0.01  # Fast polling for OBS->MIDI sync, MIDI->OBS is instant
 MIDI_CHANNEL = 1
 # faders CC (à adapter selon ce que ta X-Touch émet)
 FADER_CCS = [0, 1, 2, 3, 4, 5, 6, 7]
 
 # ------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(message)s")
 
 def midi_to_linear(v): return max(0.0, min(1.0, v/127.0))
 def linear_to_midi(v): return int(round(max(0.0, min(1.0, v))*127))
+
+# Linear dB mapping helpers
+MIN_DB = -95.0  # Minimum dB for fader bottom (OBS lowest before -inf)
+MAX_DB = 0.0    # Maximum dB for fader top
+
+def fader_to_db(fader_val):
+    """Map fader (0.0-1.0) to dB (MIN_DB to MAX_DB) linearly."""
+    return MIN_DB + (MAX_DB - MIN_DB) * fader_val
+
+def db_to_fader(db_val):
+    """Map dB (MIN_DB to MAX_DB) to fader (0.0-1.0) linearly."""
+    return (db_val - MIN_DB) / (MAX_DB - MIN_DB)
+
+def db_to_multiplier(db_val):
+    """Convert dB to OBS volume multiplier."""
+    return 10 ** (db_val / 20.0)
+
+def multiplier_to_db(mult):
+    import math
+    if mult <= 0:
+        return MIN_DB
+    return 20.0 * math.log10(mult)
 
 def find_midi_ports(substr):
     ins, outs = mido.get_input_names(), mido.get_output_names()
@@ -36,8 +58,8 @@ def find_midi_ports(substr):
     filtered_ports = [n for n in x_touch_ports if 'MIDIOUT2' not in n.upper()]
     outport = filtered_ports[0] if filtered_ports else (x_touch_ports[0] if x_touch_ports else None)
     inport = next((n for n in ins if substr.upper() in n.upper()), None)
-    logging.info(f"[PORTS] X-Touch output ports found: {x_touch_ports}")
-    logging.info(f"[PORTS] Selected output port: {outport}")
+    # logging.info(f"[PORTS] X-Touch output ports found: {x_touch_ports}")
+    # logging.info(f"[PORTS] Selected output port: {outport}")
     return (inport, outport)
 
 # ------------------------------------------------------------
@@ -47,25 +69,38 @@ class ObsBridge:
     def connect(self):
         self.req = obs.ReqClient(host=OBS_HOST, port=OBS_PORT, password=OBS_PASSWORD, timeout=3)
         self.req.get_version()  # test
-        logging.info("Connecté OBS WebSocket")
+        # logging.info("Connecté OBS WebSocket")
     def get_audio_inputs_for_current_scene(self):
-        # Fetch all inputs and filter for audio sources
-        all_inputs = self.req.get_input_list().inputs
-        logging.info(f"[DEBUG] Full OBS input list: {all_inputs}")
+        resp = self.req.get_input_list()
+        if hasattr(resp, 'inputs'):
+            all_inputs = resp.inputs
+        elif isinstance(resp, dict) and 'inputs' in resp:
+            all_inputs = resp['inputs']
+        else:
+            all_inputs = []
+        # Only use true audio mixer channels (where get_input_volume works)
         audio_kinds = [
             "wasapi_input_capture", "wasapi_output_capture", "wasapi_process_output_capture",
-            "dshow_input", "ffmpeg_source", "pulse_input_capture", "pulse_output_capture"
+            "pulse_input_capture", "pulse_output_capture"
         ]
-        audio_inputs = [inp["inputName"] for inp in all_inputs if inp["inputKind"] in audio_kinds]
-        logging.info(f"Audio inputs found (global): {audio_inputs}")
+        audio_inputs = []
+        for inp in all_inputs:
+            if inp.get("inputKind") in audio_kinds:
+                # Test if get_input_volume works for this input
+                try:
+                    vol = self.get_input_volume(inp["inputName"])
+                    if vol is not None:
+                        audio_inputs.append(inp["inputName"])
+                except Exception:
+                    pass
         return audio_inputs
     def get_input_volume(self, name):
         try:
             resp = self.req.get_input_volume(name)
-            logging.info(f"[DEBUG] get_input_volume response for '{name}': {resp}")
-            logging.info(f"[DEBUG] dir(resp): {dir(resp)}")
-            if hasattr(resp, '__dict__'):
-                logging.info(f"[DEBUG] resp.__dict__: {resp.__dict__}")
+            # logging.info(f"[DEBUG] get_input_volume response for '{name}': {resp}")
+            # logging.info(f"[DEBUG] dir(resp): {dir(resp)}")
+            # if hasattr(resp, '__dict__'):
+            #     logging.info(f"[DEBUG] resp.__dict__: {resp.__dict__}")
             # Use input_volume_mul if available
             if hasattr(resp, 'input_volume_mul'):
                 return float(resp.input_volume_mul)
@@ -74,7 +109,7 @@ class ObsBridge:
             elif hasattr(resp, 'inputVolume'):
                 return float(resp.inputVolume)
             else:
-                logging.warning(f"[DEBUG] get_input_volume: No input_volume_mul, input_volume or inputVolume attribute for '{name}'")
+                # logging.warning(f"[DEBUG] get_input_volume: No input_volume_mul, input_volume or inputVolume attribute for '{name}'")
                 return None
         except Exception as e:
             logging.warning(f"[DEBUG] get_input_volume failed for '{name}': {e}")
@@ -99,8 +134,8 @@ class MidiObsThread(threading.Thread):
         pitch_val = max(-8192, min(8191, pitch_val))
         msg = mido.Message("pitchwheel", channel=fader_idx, pitch=pitch_val)
         self.outport.send(msg)
-        logging.info(f"[SEND] {msg}")
-        logging.info(f"[OBS->MIDI] Send to X-Touch: pitchwheel channel={fader_idx} value={pitch_val}")
+        # logging.info(f"[SEND] {msg}")
+        # logging.info(f"[OBS->MIDI] Send to X-Touch: pitchwheel channel={fader_idx} value={pitch_val}")
 
     def send_mcu_handshake(self):
         # Try sending SysEx with and without F0/F7 for compatibility
@@ -108,14 +143,14 @@ class MidiObsThread(threading.Thread):
             # Standard Mackie MCU handshake SysEx: F0 00 00 66 14 10 01 F7
             sysex = [0x00, 0x00, 0x66, 0x14, 0x10, 0x01]
             self.outport.send(mido.Message('sysex', data=sysex))
-            logging.info("[MCU] Sent handshake SysEx to X-Touch (no F0/F7)")
+            # logging.info("[MCU] Sent handshake SysEx to X-Touch (no F0/F7)")
         except Exception as e:
             logging.error(f"[MCU] Error sending handshake (no F0/F7): {e}")
         try:
             # Some devices require F0/F7 included
             sysex_full = [0xF0, 0x00, 0x00, 0x66, 0x14, 0x10, 0x01, 0xF7]
             self.outport.send(mido.Message('sysex', data=sysex_full[1:-1]))
-            logging.info("[MCU] Sent handshake SysEx to X-Touch (with F0/F7 removed for mido)")
+            # logging.info("[MCU] Sent handshake SysEx to X-Touch (with F0/F7 removed for mido)")
         except Exception as e:
             logging.error(f"[MCU] Error sending handshake (with F0/F7): {e}")
 
@@ -126,7 +161,7 @@ class MidiObsThread(threading.Thread):
                 try:
                     with mido.open_output(port_name) as test_out:
                         test_out.send(mido.Message("pitchwheel", channel=channel, pitch=pitch_val))
-                        logging.info(f"[TEST] Sent pitchwheel to {port_name} channel={channel} pitch={pitch_val}")
+                        # logging.info(f"[TEST] Sent pitchwheel to {port_name} channel={channel} pitch={pitch_val}")
                 except Exception as e:
                     logging.error(f"[TEST] Error sending to {port_name}: {e}")
 
@@ -137,11 +172,24 @@ class MidiObsThread(threading.Thread):
             v = 0.5 + 0.5 * math.sin(t/5.0 * math.pi)  # oscillate between 0 and 1
             self.send_fader_position(0, v)
             time.sleep(0.1)
-        logging.info("[TEST] Fader test loop done.")
+        # logging.info("[TEST] Fader test loop done.")
+
+    def send_lcd_label(self, channel, text):
+        """Send a 7-char label to the X-Touch LCD for a given channel (0-7). Only ASCII 32-126 allowed."""
+        # X-Touch LCD SysEx: F0 00 00 66 14 12 cc t1 t2 t3 t4 t5 t6 t7 F7
+        # cc = channel (0-7), t1-t7 = ASCII chars
+        label = text[:7].ljust(7)
+        # Only allow ASCII 32-126, replace others with space
+        safe_label = ''.join(c if 32 <= ord(c) <= 126 else ' ' for c in label)
+        sysex = [0x00, 0x00, 0x66, 0x14, 0x12, channel] + [ord(c) for c in safe_label]
+        try:
+            self.outport.send(mido.Message('sysex', data=sysex))
+        except Exception as e:
+            logging.error(f"[LCD] Error sending label to channel {channel}: {e}")
 
     def run(self):
         # Log available MIDI output ports for troubleshooting
-        logging.info(f"Available MIDI output ports: {mido.get_output_names()}")
+        # logging.info(f"Available MIDI output ports: {mido.get_output_names()}")
         self.obs.connect()
         # auto-map selon scène
         inputs = self.obs.get_audio_inputs_for_current_scene()
@@ -150,7 +198,7 @@ class MidiObsThread(threading.Thread):
         try:
             self.inport = mido.open_input(self.midi_in_name)
             self.outport = mido.open_output(self.midi_out_name)
-            logging.info(f"[MIDI] Opened IN: {self.midi_in_name} OUT: {self.midi_out_name}")
+            # logging.info(f"[MIDI] Opened IN: {self.midi_in_name} OUT: {self.midi_out_name}")
         except Exception as e:
             logging.error(f"[MIDI] Error opening ports: {e}")
             self.log(f"Erreur ouverture port MIDI: {e}")
@@ -164,67 +212,85 @@ class MidiObsThread(threading.Thread):
         # Init: synchronize X-Touch faders to OBS values
         for cc, name in self.fader_map.items():
             val = self.obs.get_input_volume(name)
-            logging.info(f"[DEBUG] OBS volume for fader {cc} ({name}): {val}")
+            # Convert multiplier to dB, then to fader position
             if val is not None:
+                db_val = multiplier_to_db(val)
+                fader_val = db_to_fader(db_val)
                 try:
-                    self.send_fader_position(cc, val)
-                    logging.info(f"[INIT] Send to X-Touch: fader {cc} value {val} for {name}")
+                    self.send_fader_position(cc, fader_val)
                 except Exception as e:
                     logging.error(f"[MIDI] Error sending fader position: {e}")
-                self.last_vals[cc] = val
+                self.last_vals[cc] = fader_val
                 time.sleep(0.05)
         # Extra: after a short delay, refresh all fader positions to ensure sync
         time.sleep(0.5)
         for cc, name in self.fader_map.items():
             val = self.obs.get_input_volume(name)
-            logging.info(f"[DEBUG] OBS volume for fader {cc} ({name}): {val}")
             if val is not None:
+                db_val = multiplier_to_db(val)
+                fader_val = db_to_fader(db_val)
                 try:
-                    self.send_fader_position(cc, val)
-                    logging.info(f"[REFRESH] Send to X-Touch: fader {cc} value {val} for {name}")
+                    self.send_fader_position(cc, fader_val)
                 except Exception as e:
                     logging.error(f"[MIDI] Error sending fader position: {e}")
-                self.last_vals[cc] = val
+                self.last_vals[cc] = fader_val
                 time.sleep(0.05)
+        # Send LCD labels for each fader (initial)
+        for cc, name in self.fader_map.items():
+            self.send_lcd_label(cc, name)
+        # Start LCD label refresh thread
+        def lcd_label_refresh():
+            while self.running:
+                # Get latest audio input names from OBS
+                audio_inputs = self.obs.get_audio_inputs_for_current_scene()
+                for cc, name in self.fader_map.items():
+                    # If the mapped name is still present, use it; else, keep old
+                    label = name
+                    for ain in audio_inputs:
+                        if ain == name:
+                            label = ain
+                            break
+                    self.send_lcd_label(cc, label)
+                time.sleep(5)
+        threading.Thread(target=lcd_label_refresh, daemon=True).start()
         self.fader_touched = {cc: False for cc in self.fader_map}
         while self.running:
             # traiter messages MIDI entrants
             for msg in self.inport.iter_pending():
-                logging.info(f"[MIDI IN] {msg}")
+                # logging.info(f"[MIDI IN] {msg}")
                 # Detect fader touch/release (note_on for note 104, velocity>0 = touch, velocity==0 = release)
                 if msg.type == "note_on" and msg.note == 104:
                     if msg.velocity > 0:
                         self.fader_touched[0] = True
-                        logging.info("[TOUCH] Fader 0 touched")
+                        # logging.info("[TOUCH] Fader 0 touched")
                     else:
                         self.fader_touched[0] = False
-                        logging.info("[TOUCH] Fader 0 released")
+                        # logging.info("[TOUCH] Fader 0 released")
                 # Handle pitchwheel for faders
                 if msg.type == "pitchwheel" and msg.channel in self.fader_map:
-                    lin = (msg.pitch + 8192) / 16383.0
-                    logging.info(f"[MIDI->OBS] Set {self.fader_map[msg.channel]} to {lin:.3f}")
-                    # Send to OBS immediately for real-time update
-                    self.obs.set_input_volume(self.fader_map[msg.channel], lin)
-                    self.last_vals[msg.channel] = lin
-                # Optionally, still handle control_change for other controls
+                    fader_val = (msg.pitch + 8192) / 16383.0
+                    db_val = fader_to_db(fader_val)
+                    multiplier = db_to_multiplier(db_val)
+                    self.obs.set_input_volume(self.fader_map[msg.channel], multiplier)
+                    self.last_vals[msg.channel] = fader_val
                 if msg.type == "control_change" and msg.control in self.fader_map and msg.channel == msg.control:
-                    lin = midi_to_linear(msg.value)
-                    logging.info(f"[MIDI->OBS] Set {self.fader_map[msg.control]} to {lin:.3f}")
-                    # Send to OBS immediately for real-time update
-                    self.obs.set_input_volume(self.fader_map[msg.control], lin)
-                    self.last_vals[msg.control] = lin
+                    fader_val = midi_to_linear(msg.value)
+                    db_val = fader_to_db(fader_val)
+                    multiplier = db_to_multiplier(db_val)
+                    self.obs.set_input_volume(self.fader_map[msg.control], multiplier)
+                    self.last_vals[msg.control] = fader_val
             # polling OBS -> envoyer aux moteurs (all faders, all channels)
             for cc, name in self.fader_map.items():
                 val = self.obs.get_input_volume(name)
-                logging.info(f"[DEBUG] OBS volume for fader {cc} ({name}): {val}")
                 if not self.fader_touched.get(cc, False):
                     if val is not None:
+                        db_val = multiplier_to_db(val)
+                        fader_val = db_to_fader(db_val)
                         try:
-                            self.send_fader_position(cc, val)
-                            logging.info(f"[OBS->MIDI] Send to X-Touch: fader {cc} value {val} for {name}")
+                            self.send_fader_position(cc, fader_val)
                         except Exception as e:
                             logging.error(f"[MIDI] Error sending fader position: {e}")
-                        self.last_vals[cc] = val
+                        self.last_vals[cc] = fader_val
                         time.sleep(0.01)
             time.sleep(POLL_INTERVAL)
 
